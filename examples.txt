@@ -1,0 +1,9 @@
+# 常用调用示例
+# 转发本地 :8080 到内网 MySQL
+tcpfwd --listen :8080 --upstream 10.0.0.5:3306
+
+# 转发本机 127.0.0.1:8080 到远端 Redis
+tcpfwd --listen 127.0.0.1:8080 --upstream redis.internal:6379
+
+# 调试某 TCP 服务时挂 5 分钟读空闲超时
+tcpfwd --listen :9000 --upstream api.example.com:443 --read-timeout 5m --log-level debug
