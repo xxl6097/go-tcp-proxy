@@ -1,4 +1,7 @@
 # 常用调用示例
+
+## 命令行
+
 # 转发本地 :8080 到内网 MySQL
 tcpfwd --listen :8080 --upstream 10.0.0.5:3306
 
@@ -7,3 +10,47 @@ tcpfwd --listen 127.0.0.1:8080 --upstream redis.internal:6379
 
 # 调试某 TCP 服务时挂 5 分钟读空闲超时
 tcpfwd --listen :9000 --upstream api.example.com:443 --read-timeout 5m --log-level debug
+
+# 上游抖动场景：每 2s 一次最多重试 5 次后放弃（拨号失败 + 中途断开都触发）
+tcpfwd --listen :8080 --upstream 10.0.0.5:3306 \
+    --retry-interval 2s --retry-attempts 5
+
+# 上游抖动场景：无限重试（仅靠 SIGINT/SIGTERM 停）
+tcpfwd --listen :8080 --upstream 10.0.0.5:3306 --retry-interval 5s
+
+## Go 库
+
+# 在你的项目里加依赖
+go get github.com/uuxia/tcpfwd/proxy
+
+# 最小用例
+cat > main.go <<'GO'
+package main
+
+import (
+    "context"
+    "log/slog"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "github.com/uuxia/tcpfwd/proxy"
+)
+
+func main() {
+    ctx, cancel := signal.NotifyContext(context.Background(),
+        syscall.SIGINT, syscall.SIGTERM)
+    defer cancel()
+
+    p := &proxy.Proxy{
+        ListenAddr:   ":8080",
+        UpstreamAddr: "10.0.0.5:3306",
+        Log:          slog.Default(),
+    }
+    _ = p.Run(ctx, proxy.WithUpstreamRetry(0, 2*time.Second))
+}
+GO
+
+# 看完整 API
+go doc github.com/uuxia/tcpfwd/proxy.Proxy
+go doc github.com/uuxia/tcpfwd/proxy.WithUpstreamRetry
