@@ -12,7 +12,7 @@
 ```
 tcpfwd/
 ├── go.mod                      # module github.com/uuxia/tcpfwd
-├── proxy/                      # 库，import "github.com/uuxia/tcpfwd/proxy"
+├── proxy/                      # 库，import "github.com/xxl6097/go-tcp-proxy"
 │   ├── proxy.go
 │   ├── proxy_test.go
 │   └── example_test.go
@@ -23,11 +23,11 @@ tcpfwd/
 ## 作为库使用
 
 ```bash
-go get github.com/uuxia/tcpfwd/proxy
+go get github.com/xxl6097/go-tcp-proxy
 ```
 
 ```go
-import "github.com/uuxia/tcpfwd/proxy"
+import "github.com/xxl6097/go-tcp-proxy"
 
 // 最小用例
 p := &proxy.Proxy{
