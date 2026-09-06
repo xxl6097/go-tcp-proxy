@@ -81,6 +81,8 @@ go install ./cmd/tcpfwd
 # 或在仓库根目录快速跑
 go run ./cmd/tcpfwd --listen :8080 --upstream 10.0.0.5:3306
 
+go run ./cmd/tcpfwd --listen :8080 --upstream 103.42.30.173:7663
+
 # 开启上游抖动重试：每 2s 一次，最多 5 次（0 = 无限）
 go run ./cmd/tcpfwd --listen :8080 --upstream 10.0.0.5:3306 \
     --retry-interval 2s --retry-attempts 5

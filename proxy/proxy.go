@@ -288,13 +288,24 @@ func (p *Proxy) handle(parent context.Context, c net.Conn) {
 			)
 		}
 
-		c2uErr, u2cErr, rx, tx := p.pipe(parent, c, up)
+		c2uSide, u2cSide, rx, tx := p.pipe(parent, c, up)
 		totalRx += rx
 		totalTx += tx
 		_ = up.Close()
 
 		// 客户端主动断 / ctx 取消 → 直接退出
-		if parent.Err() != nil || isClientSide(c2uErr) {
+		if parent.Err() != nil || isClientSide(c2uSide, u2cSide) {
+			p.Log.Info("conn_close_client",
+				"conn_id", cid,
+				"client", client,
+				"upstream", p.UpstreamAddr,
+				"reason", "client_or_ctx",
+				"c2u_side", c2uSide.String(),
+				"u2c_side", u2cSide.String(),
+				"rx_bytes", totalRx,
+				"tx_bytes", totalTx,
+				"attempts", attempts,
+			)
 			break
 		}
 		// upstream 断开
@@ -303,7 +314,8 @@ func (p *Proxy) handle(parent context.Context, c net.Conn) {
 			"client", client,
 			"upstream", p.UpstreamAddr,
 			"attempt", attempts,
-			"err", errStr(u2cErr),
+			"c2u_side", c2uSide.String(),
+			"u2c_side", u2cSide.String(),
 			"rx_so_far", totalRx,
 			"tx_so_far", totalTx,
 		)
@@ -326,10 +338,14 @@ func (p *Proxy) handle(parent context.Context, c net.Conn) {
 // pipe 启动双向 splice 直到任一端退出。
 //
 // 返回值：
-//   - c2uErr: 客户端→upstream 方向错误（client 侧问题），非 nil 时整个连接应退出；
-//   - u2cErr: upstream→客户端 方向错误（upstream 侧问题），可重连；
-//   - rx/tx: 各自方向的写入字节数（与方向对应）。
-func (p *Proxy) pipe(parent context.Context, c, up net.Conn) (c2uErr, u2cErr error, rx, tx int64) {
+//   - c2uSide: c2u 方向（client→upstream）退出时错误来自哪一侧
+//   - u2cSide: u2c 方向（upstream→client）退出时错误来自哪一侧
+//   - rx: c2u 方向成功写入到 upstream 的字节数（=从 client 读到的字节数）
+//   - tx: u2c 方向成功写入到 client 的字节数（=从 upstream 读到的字节数）
+//
+// 调用方据此判断是否需要重连 upstream：c2uSide==sideClient 或 u2cSide==sideClient
+// 视为客户端主动断开，否则视为上游抖动可重连。
+func (p *Proxy) pipe(parent context.Context, c, up net.Conn) (c2uSide, u2cSide errSide, rx, tx int64) {
 	pipeCtx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -341,10 +357,10 @@ func (p *Proxy) pipe(parent context.Context, c, up net.Conn) (c2uErr, u2cErr err
 				p.Log.Error("c2u_panic", "panic", fmt.Sprintf("%v", r))
 			}
 		}()
-		// c2u: 读 client → 写 upstream
-		n, err := splice(pipeCtx, p, up, c)
+		// c2u: src=client, dst=upstream
+		n, _, side := splice(pipeCtx, p, up, c, true /* srcIsClient */)
 		atomic.AddInt64(&rx, n)
-		c2uErr = err
+		c2uSide = side
 		cancel()
 	}()
 	go func() {
@@ -354,23 +370,28 @@ func (p *Proxy) pipe(parent context.Context, c, up net.Conn) (c2uErr, u2cErr err
 				p.Log.Error("u2c_panic", "panic", fmt.Sprintf("%v", r))
 			}
 		}()
-		// u2c: 读 upstream → 写 client
-		n, err := splice(pipeCtx, p, c, up)
+		// u2c: src=upstream, dst=client
+		n, _, side := splice(pipeCtx, p, c, up, false /* srcIsClient */)
 		atomic.AddInt64(&tx, n)
-		u2cErr = err
+		u2cSide = side
 		cancel()
 	}()
 	wg.Wait()
 	return
 }
 
-// splice 把 src 的字节拷到 dst，返回写入字节数与最终错误。
+// splice 把 src 的字节拷到 dst，返回写入字节数与最终错误 + 错误来源侧。
+//
+// 关键设计：splice 必须能精确告诉调用方"是哪一侧引起的断开"，而不是只
+// 返回一个笼统的 error。否则当 upstream RST 时，c2u 方向的 dst.Write 也会
+// 失败、u2c 方向的 src.Read 也会失败，调用方无法分辨"client 主动断开"与
+// "upstream 抖动"，导致重连逻辑混乱。
 //
 // 退出条件（按优先级）：
 //   - ctx 取消：通过 src.SetReadDeadline 让阻塞中的 Read 立即返回；splice
 //     自身**不关闭任何连接**，由调用方（pipe / handle）负责释放；
-//   - Read 拿到 EOF / 非 timeout 错误：返回 error（告诉上游是谁的锅）；
-//   - Write 失败：返回 error。
+//   - Read 拿到 EOF / 非 timeout 错误：返回 error + 对应侧；
+//   - Write 失败：返回 error + 对应侧。
 //
 // timeout（p.ReadTimeout > 0）：每次 Read 限定 timeout 时间，到期当作"空闲"继续等，
 // 不算错误。
@@ -378,7 +399,10 @@ func (p *Proxy) pipe(parent context.Context, c, up net.Conn) (c2uErr, u2cErr err
 // 关键点：每次 splice 退出时（defer）必须把 src 的 ReadDeadline 还原成 time.Time{}，
 // 因为同一条 client conn c 会在 reconnect 后被新一次 splice 复用，上一轮的
 // SetReadDeadline(now) 会让下一次 Read 立刻 timeout 形成 busy-loop。
-func splice(ctx context.Context, p *Proxy, dst, src net.Conn) (int64, error) {
+//
+// srcIsClient 为 true 表示 src 是客户端连接（c2u 方向），dst 自然是 upstream；
+// 为 false 表示 src 是 upstream（u2c 方向），dst 是客户端。
+func splice(ctx context.Context, p *Proxy, dst, src net.Conn, srcIsClient bool) (int64, error, errSide) {
 	var total int64
 	buf := make([]byte, 16*1024)
 	stop := make(chan struct{})
@@ -398,27 +422,37 @@ func splice(ctx context.Context, p *Proxy, dst, src net.Conn) (int64, error) {
 	for {
 		select {
 		case <-stop:
-			return total, nil
+			return total, nil, sideUnknown
 		default:
 		}
 		if p.ReadTimeout > 0 {
 			_ = src.SetReadDeadline(time.Now().Add(p.ReadTimeout))
 		}
-		n, err := src.Read(buf)
+		n, rerr := src.Read(buf)
 		if n > 0 {
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return total, werr
+				// dst.Write 失败 → dst 那一侧断开
+				if srcIsClient {
+					// c2u：dst=upstream，upstream 写失败 → upstream dead
+					return total, werr, sideUpstream
+				}
+				// u2c：dst=client，client 写失败 → client dead
+				return total, werr, sideClient
 			}
 			total += int64(n)
 		}
-		if err != nil {
+		if rerr != nil {
 			if ctx.Err() != nil {
-				return total, nil
+				return total, nil, sideUnknown
 			}
-			if isNetTimeout(err) {
+			if isNetTimeout(rerr) {
 				continue
 			}
-			return total, err
+			// src.Read 失败 → src 那一侧断开
+			if srcIsClient {
+				return total, rerr, sideClient
+			}
+			return total, rerr, sideUpstream
 		}
 	}
 }
@@ -438,18 +472,46 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// isClientSide 判定错误是否来自客户端一侧（c2u 方向）。
-// client EOF / client Read 超时 / client Write 失败 → 客户端主动断，
-// 不应该重连 upstream。
-func isClientSide(err error) bool {
-	if err == nil {
-		return false
+// errSide 标注 splice 退出时错误来自哪一侧。这是正确判断"客户端主动断开
+//" vs "upstream 抖动"的关键。
+//
+// 之所以不能只用一个 bool error：c2u 方向的 dst.Write 失败（upstream RST）和
+// u2c 方向的 src.Read 失败（upstream RST）描述的是同一个物理事件，但
+// 老代码无法分辨，导致 retry 行为完全不可预测。
+type errSide uint8
+
+const (
+	sideUnknown errSide = iota
+	sideClient           // 来自 client 的对端断开/错误
+	sideUpstream         // 来自 upstream 的对端断开/错误
+)
+
+func (s errSide) String() string {
+	switch s {
+	case sideClient:
+		return "client"
+	case sideUpstream:
+		return "upstream"
+	default:
+		return "unknown"
 	}
-	// io.EOF：远端正常关闭，正常路径
-	return true
+}
+
+// isClientSide 判定"是否应该认为这次断开是客户端主动为之"，若是则 handle 应
+// 直接退出、不要再尝试重连 upstream。
+//
+// 判定规则：
+//   - c2u 方向 src.Read 失败 → 客户端断开（client EOF/RST）
+//   - u2c 方向 dst.Write 失败 → 客户端断开（client EOF/RST）
+//   - 其余情况（upstream 抖动 / ctx 取消）→ 不要当 client 断开
+//
+// 如果两侧侧同时给出矛盾信号，优先信 client（保守退出，不重连）。
+func isClientSide(c2uSide, u2cSide errSide) bool {
+	return c2uSide == sideClient || u2cSide == sideClient
 }
 
 // errStr 把 error 转成简短字符串，nil 时给 "-"。
+// （注：本版本已不再需要——handle 直接记录 c2uSide/u2cSide；保留以备调用方使用。）
 func errStr(err error) string {
 	if err == nil {
 		return "-"

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/uuxia/tcpfwd/proxy"
+	"github.com/xxl6097/go-tcp-proxy/proxy"
 )
 
 // 找一对空闲端口：upstream 端口先占再放，proxy 端口后占再放，二者通常不会冲突。
@@ -705,4 +705,159 @@ func TestProxy_DefaultNoRetry(t *testing.T) {
 	}
 	// 1.5s 内不应有第二次"重连"行为（没有重连逻辑）
 	// 这里只验证语义，不做严格时序断言
+}
+
+// startEchoReadThenRST 模拟真实生产场景：upstream 接收一些数据后 RST 连接。
+// 这是用户日志里遇到的"upstream 收 722 字节后 RST"场景的复现。
+//
+// 行为：
+//   - 第一次 accept：read 一些数据（模拟收业务请求）后立刻 SetLinger(0)+Close → RST；
+//   - 后续 accept：正常 echo。
+//
+// 返回地址 + stop。
+func startEchoReadThenRST(t *testing.T, readBytes int) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu      sync.Mutex
+		closed  bool
+		wg      sync.WaitGroup
+		stopped bool
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			first := !closed
+			closed = true
+			mu.Unlock()
+			if first {
+				// 收一些字节（block 直到 client 写够），然后 SetLinger(0)+Close → TCP RST
+				go func(c net.Conn) {
+					defer c.Close()
+					buf := make([]byte, readBytes)
+					_, _ = io.ReadFull(c, buf)
+					if tcp, ok := c.(*net.TCPConn); ok {
+						_ = tcp.SetLinger(0)
+					}
+					c.Close() // 触发 RST 而非 FIN
+				}(c)
+				continue
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}()
+	stop = func() {
+		mu.Lock()
+		if stopped {
+			mu.Unlock()
+			return
+		}
+		stopped = true
+		mu.Unlock()
+		ln.Close()
+		wg.Wait()
+	}
+	return ln.Addr().String(), stop
+}
+
+// TestProxy_Reconnect_UpstreamRST 验证：upstream 收到数据后 RST（不是 FIN），
+// proxy 应识别为"上游断开"并自动重连，客户端连接保持。
+//
+// 这对应用户日志中的关键 bug 场景：
+//   rx_so_far=722 tx_so_far=0 err="read ...: connection reset by peer" attempts=1
+// 期望：开启 retry 后 attempts ≥ 2，client 后续 write 能拿到 echo。
+func TestProxy_Reconnect_UpstreamRST(t *testing.T) {
+	// 1. 第一次 accept：读到 8 字节后 RST
+	// 2. 后续 accept：正常 echo
+	addr, stopUp := startEchoReadThenRST(t, 8)
+	defer stopUp()
+
+	proxyAddr, _ := pickPorts(t)
+	p := &proxy.Proxy{
+		ListenAddr:   proxyAddr,
+		UpstreamAddr: addr,
+	}
+	logBuf := &safeBuf{}
+	p.Log = slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = p.Run(ctx,
+			proxy.WithUpstreamRetry(0, 100*time.Millisecond), // 无限重试
+		)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	time.Sleep(50 * time.Millisecond) // 等 proxy_listen
+
+	c, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 第一波：发 8 字节触发 upstream RST。客户端这边的 write 不一定报错
+	// （数据进了 TCP 缓冲）。Read 给个短 deadline，因为 proxy 不会主动
+	// 把 upstream RST 通知给客户端（中间链路只关 upstream，不动 client）。
+	c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Write([]byte("12345678")); err != nil {
+		t.Logf("first write err (may be ok if upstream already RSTed): %v", err)
+	}
+	c.SetWriteDeadline(time.Time{})
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	_, rerr := c.Read(buf)
+	t.Logf("first read err=%v (expected non-nil within 2s)", rerr)
+	if rerr == nil {
+		t.Fatal("expected first read to fail (upstream RSTed)")
+	}
+	c.SetReadDeadline(time.Time{}) // 清除 read deadline，让后续 read 等足够久
+
+	// 等 attempt=2 出现（retry 触发）
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logBuf.String(), "attempt=2") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	out := logBuf.String()
+	t.Logf("proxy logBuf len=%d, content:\n%s", len(out), out)
+	if !strings.Contains(out, "attempt=2") {
+		t.Fatal("expected attempt=2 (retry) after upstream RST, but never happened")
+	}
+
+	// 第二波：重连后客户端重新写，期望 echo 回来
+	msg := []byte("after-rst\n")
+	c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Write(msg); err != nil {
+		t.Fatalf("post-reconnect write: %v", err)
+	}
+	c.SetWriteDeadline(time.Time{})
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Logf("log:\n%s", logBuf.String())
+		t.Fatalf("post-reconnect read: %v", err)
+	}
+	c.SetReadDeadline(time.Time{})
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("echo mismatch: got=%q want=%q", got, msg)
+	}
 }

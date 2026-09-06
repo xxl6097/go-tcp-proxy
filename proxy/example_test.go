@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/uuxia/tcpfwd/proxy"
+	"github.com/xxl6097/go-tcp-proxy/proxy"
 )
 
 // ExampleProxy_basic 演示最简用法：注入 Listener、转发到远端、收完数据
