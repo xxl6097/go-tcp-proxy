@@ -75,6 +75,9 @@ func WithUpstreamRetry(maxAttempts int, interval time.Duration) Option
 ## 作为命令行工具
 
 ```bash
+
+go run ./cmd/tcpfwd --listen :8080 --upstream 103.42.30.173:7663 --retry-interval 2s --retry-attempts 0
+
 # 编译到 $GOBIN/tcpfwd
 go install ./cmd/tcpfwd
 
